@@ -78,6 +78,10 @@ const Station STATIONS[] = {
   { "SomaFM DEF CON",      "http://ice1.somafm.com/defcon-128-mp3"      },
   { "SomaFM Drone Zone",   "http://ice1.somafm.com/dronezone-128-mp3"   },
   { "SomaFM Indie Pop",    "http://ice1.somafm.com/indiepop-128-mp3"    },
+  { "RT HK Radio 1",         "https://rthk.hk/live1.m3u" },
+  { "RT HK Radio 2",         "https://rthk.hk/live2.m3u" },
+  { "RT HK Radio 3",         "https://rthk.hk/live3.m3u" },
+  { "RT HK Radio 4",         "https://rthk.hk/live4.m3u" }
 };
 const int NUM_STATIONS = sizeof(STATIONS) / sizeof(STATIONS[0]);
 
