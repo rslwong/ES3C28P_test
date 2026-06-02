@@ -1,0 +1,11 @@
+# Local, self-contained arduino-cli configuration.
+# Everything (the ESP32 core/toolchain AND all libraries) is installed UNDER
+# this project directory so nothing outside ./ is referenced.
+directories:
+  data: ./.arduino/data           # cores, toolchains, board packages
+  downloads: ./.arduino/downloads  # download cache
+  user: ./.arduino/user           # libraries live in ./.arduino/user/libraries
+
+board_manager:
+  additional_urls:
+    - https://espressif.github.io/arduino-esp32/package_esp32_index.json
