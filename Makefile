@@ -16,8 +16,10 @@
 
 CONFIG    := arduino-cli.yaml
 ACLI      := arduino-cli --config-file $(CONFIG)
-SKETCH    := ES3C28P_demo
-BUILD_DIR := build
+# Which sketch to build. Override on the command line, e.g.:
+#   make flash SKETCH=ES3C28P_demo
+SKETCH    ?= ES3C28P_radio
+BUILD_DIR := build/$(SKETCH)
 
 # ESP32-S3 with USB-CDC serial on boot, 16MB flash, OPI PSRAM (N16R8).
 FQBN := esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB
@@ -35,7 +37,7 @@ all: build
 deps:
 	$(ACLI) core update-index
 	$(ACLI) core install esp32:esp32
-	$(ACLI) lib install "Adafruit ILI9341" "Adafruit GFX Library" "Adafruit BusIO"
+	$(ACLI) lib install "Adafruit ILI9341" "Adafruit GFX Library" "Adafruit BusIO" "ESP32-audioI2S-master"
 
 # Auto-run deps the first time if the core isn't there yet.
 $(CORE_DIR):
