@@ -4,12 +4,17 @@ Self-contained Arduino projects for the **ES3C28P** board (ESP32-S3-WROOM-1,
 2.8" 240×320 IPS, ILI9341V display + FT6336G capacitive touch + ES8311/FM8002E
 audio).
 
-Two sketches are included:
+Three sketches (AI generated) are included:
 
 - **`ES3C28P_radio`** *(default)* — internet radio. Connects to WiFi, streams
   MP3 stations, and drives the speaker through the ES8311 codec. On-screen
   touch controls: `PREV`/`NEXT` station, `VOL-`/`VOL+`, a volume bar, and
   `PLAY`/`STOP`. The current track title (ICY metadata) is shown live.
+- **`ES3C28P_mic`** — microphone test / real-time spectrum analyzer. Captures
+  the on-board mic (ES8311 ADC → I2S), runs a 256-point FFT, and draws a
+  log-spaced bar-graph spectrum with peak-hold markers. A level meter and a
+  `LISTENING`/`quiet` indicator light up when the mic detects sound, and the
+  dominant frequency is shown.
 - **`ES3C28P_demo`** — graphics + touch showcase (shapes, then a finger-paint
   app with a color palette and `CLEAR` button).
 
@@ -19,6 +24,7 @@ Two sketches are included:
 arduino-cli.yaml          local arduino-cli config (core + libs stay in ./.arduino)
 Makefile                  build / upload / monitor targets
 ES3C28P_radio/            internet-radio sketch (default)
+ES3C28P_mic/              microphone spectrum analyzer
 ES3C28P_demo/             graphics + touch demo
 .arduino/                 ESP32 core + libraries (created by `make deps`)
 build/                    compiled output (created by `make build`)
@@ -63,6 +69,23 @@ address (`0x18`) are the first things to check; both are near the top of the
 sketch. The serial log shows codec init and stream status.
 
 `make clean` removes `build/`; `make distclean` also removes `./.arduino`.
+
+## Microphone spectrum analyzer (ES3C28P_mic)
+
+```sh
+make flash SKETCH=ES3C28P_mic
+```
+
+The on-board mic feeds the **ES8311** codec's ADC, which streams 16-bit samples
+over I2S (DIN=GPIO6) to the ESP32. The sketch configures the codec for the
+analog-mic/ADC path (the playback init from the radio sketch, extended to power
+up the ADC), captures 256-sample frames at 16 kHz, runs an in-sketch radix-2
+FFT, and renders a log-spaced bar graph (Nyquist = 8 kHz). The speaker amp is
+left disabled — this sketch only listens.
+
+If the bars look dead or saturated, tune `MIC_PGA_GAIN` (analog) / `ADC_VOLUME`
+(digital), or the `SPEC_MIN_DB` / `NOISE_GATE_DB` thresholds near the top of
+[ES3C28P_mic.ino](ES3C28P_mic/ES3C28P_mic.ino).
 
 ## Hardware pin map
 
