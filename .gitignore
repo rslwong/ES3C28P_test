@@ -1,2 +1,6 @@
 build/
 .arduino/
+
+# WiFi credentials and other secrets (keep secrets.h.example committed)
+secrets.h
+**/secrets.h

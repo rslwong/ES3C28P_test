@@ -21,12 +21,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
 #include "Audio.h"          // ESP32-audioI2S
-
-// ---------------------------------------------------------------------------
-// WiFi (hard-coded as requested)
-// ---------------------------------------------------------------------------
-const char* WIFI_SSID = "xxxx";
-const char* WIFI_PASS = "xxxxxxx";
+#include "secrets.h"        // WiFi credentials (gitignored; see secrets.h.example)
 
 // ---------------------------------------------------------------------------
 // Pin map  (see board datasheet / BSP)
@@ -85,7 +80,14 @@ const Station STATIONS[] = {
 };
 const int NUM_STATIONS = sizeof(STATIONS) / sizeof(STATIONS[0]);
 
-const uint8_t VOL_MAX = 21;   // ESP32-audioI2S volume range is 0..21
+const uint8_t VOL_MAX = 21;   // number of steps on the on-screen volume slider
+
+// The on-screen volume drives the ES8311 DAC volume register (0x32) directly.
+// That register runs 0x00 (mute) .. 0xFF (0 dB, max) in 0.5 dB steps, so mapping
+// the slider here gives far more output than the old fixed 0xBF, while the
+// library's digital volume is held at full scale to preserve signal quality.
+const uint8_t VOL_REG_MIN = 0x90;  // slider = 1   (~ -55 dB, quietest audible)
+const uint8_t VOL_REG_MAX = 0xFF;  // slider = max ( 0 dB, loudest)
 
 // State
 int     curStation = 0;
@@ -187,18 +189,70 @@ bool es8311Init() {
   return true;
 }
 
+// Apply the on-screen volume (0..VOL_MAX) to the ES8311 DAC volume register.
+// Slider 0 mutes; 1..VOL_MAX maps linearly across VOL_REG_MIN..VOL_REG_MAX.
+void applyVolume() {
+  uint8_t reg;
+  if (volume == 0) {
+    reg = 0x00;                       // mute
+  } else {
+    reg = VOL_REG_MIN +
+          (uint16_t)(VOL_REG_MAX - VOL_REG_MIN) * volume / VOL_MAX;
+  }
+  es8311Write(0x32, reg);
+}
+
 // ---------------------------------------------------------------------------
 // Drawing
 // ---------------------------------------------------------------------------
+// Map the current WiFi RSSI to 0..4 signal bars. 0 means not connected.
+int wifiBars() {
+  if (WiFi.status() != WL_CONNECTED) return 0;
+  int rssi = WiFi.RSSI();           // dBm, typically -30 (strong) .. -90 (weak)
+  if (rssi >= -55) return 4;
+  if (rssi >= -65) return 3;
+  if (rssi >= -75) return 2;
+  if (rssi >= -85) return 1;
+  return 0;                          // connected but very weak
+}
+
+// Draw a 4-bar WiFi strength icon. Filled bars use a strength-based colour;
+// empty bars are outlined so the user can see how many are missing.
+void drawWifiBars() {
+  const int16_t nBars   = 4;
+  const int16_t barW    = 5;
+  const int16_t gap     = 2;
+  const int16_t baseY   = 26;        // bottom of the tallest bar
+  const int16_t totalW  = nBars * barW + (nBars - 1) * gap;
+  const int16_t x0      = SCREEN_W - 8 - totalW;
+
+  int bars = wifiBars();
+  uint16_t onColor = bars >= 3 ? ILI9341_GREEN
+                   : bars == 2 ? ILI9341_YELLOW
+                   : bars == 1 ? ILI9341_ORANGE
+                               : ILI9341_RED;
+
+  // clear the icon area first
+  tft.fillRect(x0, 6, totalW, 22, ILI9341_MAROON);
+
+  for (int i = 0; i < nBars; i++) {
+    int16_t h = 6 + i * 4;           // 6, 10, 14, 18 px tall
+    int16_t x = x0 + i * (barW + gap);
+    int16_t y = baseY - h;
+    if (i < bars)
+      tft.fillRect(x, y, barW, h, onColor);
+    else
+      tft.drawRect(x, y, barW, h, ILI9341_DARKGREY);
+  }
+}
+
 void drawTitleBar() {
   tft.fillRect(0, 0, SCREEN_W, 34, ILI9341_MAROON);
   tft.setTextColor(ILI9341_WHITE);
   tft.setTextSize(2);
   tft.setCursor(8, 9);
   tft.print("Net Radio");
-  // WiFi indicator dot
-  bool ok = WiFi.status() == WL_CONNECTED;
-  tft.fillCircle(SCREEN_W - 16, 17, 6, ok ? ILI9341_GREEN : ILI9341_RED);
+  drawWifiBars();
 }
 
 void drawStation() {
@@ -333,8 +387,10 @@ void setup() {
 
   // I2S out -> ES8311. Start I2S first so MCLK is running for codec config.
   audio.setPinout(I2S_BCLK, I2S_LRCK, I2S_DOUT, I2S_MCLK);
-  audio.setVolume(volume);                 // 0..21
+  audio.setVolume(VOL_MAX);                // run the library at full scale;
+                                           // the ES8311 register sets loudness
   es8311Init();
+  applyVolume();                           // set codec DAC volume from `volume`
   digitalWrite(PA_EN, PA_ON);              // enable amplifier
 
   // Receive ICY metadata (stream titles, station name) for the display.
@@ -370,11 +426,11 @@ void handleTouch() {
   else if (hit(btnNext, x, y)) startStation(curStation + 1);
   else if (hit(btnVolDn, x, y)) {
     if (volume > 0) volume--;
-    audio.setVolume(volume);
+    applyVolume();
     drawVolumeBar();
   } else if (hit(btnVolUp, x, y)) {
     if (volume < VOL_MAX) volume++;
-    audio.setVolume(volume);
+    applyVolume();
     drawVolumeBar();
   } else if (hit(btnPlay, x, y)) {
     if (playing) stopRadio();
@@ -389,5 +445,18 @@ void loop() {
   if (nowPlayingDirty) {
     nowPlayingDirty = false;
     drawNowPlaying();
+  }
+
+  // Refresh the WiFi strength bars every couple of seconds. Only redraw when
+  // the bar count actually changes to avoid needless SPI traffic / flicker.
+  static uint32_t lastWifiDraw = 0;
+  static int      lastBars     = -1;
+  if (millis() - lastWifiDraw > 2000) {
+    lastWifiDraw = millis();
+    int bars = wifiBars();
+    if (bars != lastBars) {
+      lastBars = bars;
+      drawWifiBars();
+    }
   }
 }
