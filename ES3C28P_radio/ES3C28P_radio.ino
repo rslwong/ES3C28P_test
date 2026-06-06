@@ -20,6 +20,7 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
+#include <Preferences.h>    // NVS-backed storage for volume / last station
 #include "Audio.h"          // ESP32-audioI2S
 #include "secrets.h"        // WiFi credentials (gitignored; see secrets.h.example)
 
@@ -52,6 +53,10 @@
 #define PA_OFF HIGH
 
 #define ES8311_ADDR 0x18
+#define ES8311_REG_DACVOL 0x32   // DAC volume: 0x00 mute .. 0xFF 0dB, 0.5dB/step
+
+// Screen dims (backlight off) after this long with no touch; any touch wakes it.
+#define SCREEN_TIMEOUT_MS 30000
 
 // Flip these to 1 if the touch axes come out mirrored on your panel.
 #define TOUCH_FLIP_X 0
@@ -62,6 +67,7 @@
 // ---------------------------------------------------------------------------
 Adafruit_ILI9341 tft = Adafruit_ILI9341(&SPI, TFT_DC, TFT_CS, TFT_RST);
 Audio audio;
+Preferences prefs;
 
 const int16_t SCREEN_W = 240;
 const int16_t SCREEN_H = 320;
@@ -73,10 +79,10 @@ const Station STATIONS[] = {
   { "SomaFM DEF CON",      "http://ice1.somafm.com/defcon-128-mp3"      },
   { "SomaFM Drone Zone",   "http://ice1.somafm.com/dronezone-128-mp3"   },
   { "SomaFM Indie Pop",    "http://ice1.somafm.com/indiepop-128-mp3"    },
-  { "RT HK Radio 1",         "https://rthk.hk/live1.m3u" },
-  { "RT HK Radio 2",         "https://rthk.hk/live2.m3u" },
-  { "RT HK Radio 3",         "https://rthk.hk/live3.m3u" },
-  { "RT HK Radio 4",         "https://rthk.hk/live4.m3u" },
+  { "RT HK Radio 1",         "https://stm.rthk.hk/radio1" },
+  { "RT HK Radio 2",         "https://stm.rthk.hk/radio2" },
+  { "RT HK Radio 3",         "https://stm.rthk.hk/radio3" },
+  { "RT HK Radio 4",         "https://stm.rthk.hk/radio4" },
   { "57FM",                  "https://listen.57fm.com/lscafe" },
   { "Toronto Cast",          "https://maggie.torontocast.com:8022/stream" }
 
@@ -96,6 +102,16 @@ const uint8_t VOL_REG_MAX = 0xFF;  // slider = max ( 0 dB, loudest)
 int     curStation = 0;
 uint8_t volume     = 10;
 bool    playing    = false;
+
+// Backlight / screen-dim state
+bool     screenOn    = true;
+uint32_t lastTouchMs = 0;
+
+// Volume + station are persisted to NVS, but lazily: a change marks them dirty
+// and the actual flash write happens a few seconds later (see loop()), so a
+// flurry of VOL +/- taps costs one write, not one per tap.
+bool     settingsDirty   = false;
+uint32_t settingsDirtyAt = 0;
 
 // Now-playing text, filled from the audio callback (same task as loop()).
 char nowPlaying[160] = "";
@@ -202,7 +218,28 @@ void applyVolume() {
     reg = VOL_REG_MIN +
           (uint16_t)(VOL_REG_MAX - VOL_REG_MIN) * volume / VOL_MAX;
   }
-  es8311Write(0x32, reg);
+  es8311Write(ES8311_REG_DACVOL, reg);
+}
+
+// ---------------------------------------------------------------------------
+// Persisted settings (NVS) and backlight control
+// ---------------------------------------------------------------------------
+void markSettingsDirty() {
+  settingsDirty   = true;
+  settingsDirtyAt = millis();
+}
+
+// putXxx() skips the write when the stored value is unchanged, so this is cheap
+// to call even when nothing actually moved.
+void saveSettings() {
+  prefs.putUChar("vol", volume);
+  prefs.putInt("station", curStation);
+  settingsDirty = false;
+}
+
+void setBacklight(bool on) {
+  digitalWrite(TFT_BL, on ? HIGH : LOW);
+  screenOn = on;
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +367,7 @@ void drawUI() {
 // ---------------------------------------------------------------------------
 void startStation(int idx) {
   curStation = (idx + NUM_STATIONS) % NUM_STATIONS;
+  markSettingsDirty();
   nowPlaying[0] = '\0';
   audio.stopSong();
   Serial.printf("Connecting: %s\n", STATIONS[curStation].url);
@@ -353,6 +391,13 @@ void setup() {
   delay(200);
   Serial.println("\nES3C28P internet radio");
 
+  // Restore persisted volume + last station (defaults if never saved).
+  prefs.begin("radio", false);
+  volume     = prefs.getUChar("vol", volume);
+  curStation = prefs.getInt("station", curStation);
+  if (volume > VOL_MAX)                       volume     = VOL_MAX;
+  if (curStation < 0 || curStation >= NUM_STATIONS) curStation = 0;
+
   // Display
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);
@@ -369,6 +414,13 @@ void setup() {
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(400000);
   touchReset();
+  // Put the FT6336 in polling mode (G_MODE reg 0xA4 = 0) so its INT line stays
+  // low for the whole time a finger is down -- we gate the I2C reads on it.
+  Wire.beginTransmission(FT6336_ADDR);
+  Wire.write(0xA4);
+  Wire.write(0x00);
+  Wire.endTransmission();
+  pinMode(TOUCH_INT, INPUT_PULLUP);
 
   // Amplifier off until the codec + stream are up (avoids a pop)
   pinMode(PA_EN, OUTPUT);
@@ -407,12 +459,21 @@ void setup() {
   };
 
   drawUI();
-  startStation(curStation);                // auto-play the first station
+  lastTouchMs = millis();                   // start the screen-dim timer
+  startStation(curStation);                // auto-play the first/last station
 }
 
 void handleTouch() {
   static bool     wasTouched = false;
   static uint32_t lastPress  = 0;
+
+  // The FT6336 holds INT low only while a finger is on the panel. When it is
+  // high there is nothing to report, so skip the I2C transaction entirely.
+  if (digitalRead(TOUCH_INT) == HIGH) {
+    wasTouched = false;
+    return;
+  }
+
   uint16_t x, y;
   bool touched = getTouch(&x, &y);
 
@@ -422,8 +483,15 @@ void handleTouch() {
     wasTouched = touched;
     return;
   }
-  wasTouched = true;
-  lastPress  = millis();
+  wasTouched  = true;
+  lastPress   = millis();
+  lastTouchMs = lastPress;
+
+  // First touch after the screen dimmed just wakes it -- don't also fire a button.
+  if (!screenOn) {
+    setBacklight(true);
+    return;
+  }
 
   if (hit(btnPrev, x, y))      startStation(curStation - 1);
   else if (hit(btnNext, x, y)) startStation(curStation + 1);
@@ -431,10 +499,12 @@ void handleTouch() {
     if (volume > 0) volume--;
     applyVolume();
     drawVolumeBar();
+    markSettingsDirty();
   } else if (hit(btnVolUp, x, y)) {
     if (volume < VOL_MAX) volume++;
     applyVolume();
     drawVolumeBar();
+    markSettingsDirty();
   } else if (hit(btnPlay, x, y)) {
     if (playing) stopRadio();
     else         startStation(curStation);
@@ -449,6 +519,12 @@ void loop() {
     nowPlayingDirty = false;
     drawNowPlaying();
   }
+
+  // Dim the backlight after a spell of no touches; handleTouch() wakes it again.
+  if (screenOn && millis() - lastTouchMs > SCREEN_TIMEOUT_MS) setBacklight(false);
+
+  // Flush pending volume/station changes to NVS once they've settled.
+  if (settingsDirty && millis() - settingsDirtyAt > 3000) saveSettings();
 
   // Refresh the WiFi strength bars every couple of seconds. Only redraw when
   // the bar count actually changes to avoid needless SPI traffic / flicker.
