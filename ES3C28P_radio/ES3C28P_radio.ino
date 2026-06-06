@@ -22,7 +22,18 @@
 #include <Adafruit_ILI9341.h>
 #include <Preferences.h>    // NVS-backed storage for volume / last station
 #include "Audio.h"          // ESP32-audioI2S
-#include "secrets.h"        // WiFi credentials (gitignored; see secrets.h.example)
+
+// WiFi credentials are now provisioned on-screen and stored in NVS (see the
+// "WiFi provisioning" section below). secrets.h is therefore optional: if it is
+// present it only seeds the very first boot, after which the saved credentials
+// take over. Build still works with no secrets.h at all.
+#if __has_include("secrets.h")
+  #include "secrets.h"      // optional seed (gitignored; see secrets.h.example)
+#endif
+#ifndef WIFI_SSID
+  #define WIFI_SSID ""
+  #define WIFI_PASS ""
+#endif
 
 // ---------------------------------------------------------------------------
 // Pin map  (see board datasheet / BSP)
@@ -455,6 +466,333 @@ void stopRadio() {
   drawPlayButton();
 }
 
+// ===========================================================================
+// WiFi provisioning
+// ---------------------------------------------------------------------------
+// The SSID + password are no longer hard-coded. They are entered on the panel
+// (scan a list of networks, type the password on an on-screen keyboard) and
+// persisted to NVS so the radio reconnects automatically after a reboot.
+//
+// Flow:
+//   boot -> try saved creds (or a one-time secrets.h seed) -> on failure run
+//   wifiSetupFlow(): pick network -> type password -> connect -> save.
+// A long-press on the title bar re-opens wifiSetupFlow() at any time.
+// ===========================================================================
+String wifiSsid;     // active credentials; also what we persist to NVS
+String wifiPass;
+
+// --- credential storage (NVS, shared "radio" namespace) --------------------
+void loadWifiCreds() {
+  wifiSsid = prefs.getString("wifi_ssid", "");
+  wifiPass = prefs.getString("wifi_pass", "");
+}
+void saveWifiCreds(const String& ssid, const String& pass) {
+  prefs.putString("wifi_ssid", ssid);
+  prefs.putString("wifi_pass", pass);
+}
+
+// --- edge-detected single tap (for the modal provisioning screens) ---------
+// Mirrors handleTouch()'s debounce, but usable standalone inside a blocking
+// loop. Returns true once per finger-down.
+bool readTap(uint16_t* x, uint16_t* y) {
+  static bool     was  = false;
+  static uint32_t last = 0;
+  if (digitalRead(TOUCH_INT) == HIGH) { was = false; return false; }
+  uint16_t tx, ty;
+  bool t = getTouch(&tx, &ty);
+  if (!t || was || millis() - last < 180) { was = t; return false; }
+  was = true; last = millis();
+  if (x) *x = tx; if (y) *y = ty;
+  return true;
+}
+
+// --- connect with on-screen progress ---------------------------------------
+bool wifiConnect(const String& ssid, const String& pass, uint32_t timeoutMs) {
+  tft.fillScreen(C_BG);
+  tft.setTextColor(C_TEXT); tft.setTextSize(2);
+  tft.setCursor(10, 110); tft.print("Connecting to:");
+  tft.setTextColor(C_ACCENT);
+  char b[22]; strlcpy(b, ssid.c_str(), sizeof(b));
+  tft.setCursor(10, 140); tft.print(b);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+
+  tft.setTextColor(C_TEXT_DIM); tft.setTextSize(2);
+  uint32_t t0 = millis();
+  int dots = 0;
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeoutMs) {
+    delay(250);
+    tft.setCursor(10 + dots * 12, 175); tft.print('.');
+    if (++dots > 17) { dots = 0; tft.fillRect(10, 175, SCREEN_W - 20, 18, C_BG); }
+    Serial.print('.');
+  }
+  Serial.println();
+
+  bool ok = WiFi.status() == WL_CONNECTED;
+  if (ok) {
+    Serial.printf("WiFi OK  %s\n", WiFi.localIP().toString().c_str());
+    tft.fillScreen(C_BG);
+    tft.setTextColor(C_ACCENT); tft.setTextSize(2);
+    tft.setCursor(10, 140); tft.print("WiFi connected");
+    delay(700);
+  }
+  return ok;
+}
+
+// --- network picker --------------------------------------------------------
+// Scans and lists nearby networks. Returns the chosen SSID, or "" if cancelled.
+String wifiPickNetwork() {
+  const int16_t ROW_H = 30, LIST_Y = 44, VIS = 7;
+  Button bUp  = {   0, 278, 46, 36, "UP",   C_SURFACE_HI };
+  Button bDn  = {  48, 278, 46, 36, "DN",   C_SURFACE_HI };
+  Button bRes = {  96, 278, 86, 36, "SCAN", C_SURFACE_HI };
+  Button bX   = { 184, 278, 56, 36, "X",    C_RED        };
+
+  int n = 0, top = 0;
+  bool needScan = true;
+
+  for (;;) {
+    if (needScan) {
+      needScan = false;
+      tft.fillScreen(C_BG);
+      tft.fillRect(0, 0, SCREEN_W, 34, C_SURFACE);
+      tft.setTextColor(C_ACCENT); tft.setTextSize(2);
+      tft.setCursor(8, 9); tft.print("Scanning...");
+      WiFi.mode(WIFI_STA);
+      WiFi.disconnect(false);
+      n = WiFi.scanNetworks();
+      if (n < 0) n = 0;
+      top = 0;
+    }
+
+    // Draw the current page.
+    tft.fillRect(0, 34, SCREEN_W, SCREEN_H - 34, C_BG);
+    tft.fillRect(0, 0, SCREEN_W, 34, C_SURFACE);
+    tft.setTextColor(C_ACCENT); tft.setTextSize(2);
+    tft.setCursor(8, 9); tft.printf("WiFi (%d)", n);
+    if (n == 0) {
+      tft.setTextColor(C_TEXT_DIM); tft.setTextSize(2);
+      tft.setCursor(20, 140); tft.print("No networks");
+    }
+    for (int i = 0; i < VIS; i++) {
+      int idx = top + i;
+      if (idx >= n) break;
+      int16_t y = LIST_Y + i * ROW_H;
+      tft.setTextColor(C_TEXT); tft.setTextSize(2);
+      char b[16]; strlcpy(b, WiFi.SSID(idx).c_str(), sizeof(b));
+      tft.setCursor(6, y + 6); tft.print(b);
+      tft.setTextColor(C_TEXT_DIM); tft.setTextSize(1);
+      if (WiFi.encryptionType(idx) != WIFI_AUTH_OPEN) {
+        tft.setCursor(SCREEN_W - 58, y + 9); tft.print("LOCK");
+      }
+      tft.setCursor(SCREEN_W - 28, y + 9); tft.printf("%d", WiFi.RSSI(idx));
+      tft.drawFastHLine(0, y + ROW_H - 1, SCREEN_W, C_BORDER);
+    }
+    drawButton(bUp); drawButton(bDn); drawButton(bRes); drawButton(bX);
+
+    // Wait for input; break out to redraw, or return on a selection.
+    for (;;) {
+      uint16_t x, y;
+      if (readTap(&x, &y)) {
+        if (hit(bX, x, y))   return String("");
+        if (hit(bRes, x, y)) { needScan = true; break; }
+        if (hit(bUp, x, y))  { if (top > 0)        top -= VIS; if (top < 0) top = 0; break; }
+        if (hit(bDn, x, y))  { if (top + VIS < n)  top += VIS; break; }
+        if (y >= LIST_Y && y < LIST_Y + VIS * ROW_H) {
+          int idx = top + (y - LIST_Y) / ROW_H;
+          if (idx < n) return WiFi.SSID(idx);
+        }
+      }
+      delay(8);
+    }
+  }
+}
+
+// --- on-screen keyboard ----------------------------------------------------
+enum { KB_LOWER, KB_UPPER, KB_SYM };
+int kbMode = KB_LOWER;
+
+// Special key codes (>0 means "insert this literal character", incl. ' ').
+#define KC_SHIFT -1
+#define KC_SYM   -2
+#define KC_BKSP  -3
+#define KC_OK    -4
+
+struct LiveKey { int16_t x, y, w, h; char label[6]; int code; };
+LiveKey kbKeys[48];
+int     kbCount = 0;
+
+const int16_t KB_Y0 = 140, KEY_H = 32, KEY_G = 3, KEY_U = 24;  // 10 units across
+
+void kbAddKey(int16_t x, int16_t y, int16_t w, const char* label, int code) {
+  LiveKey& k = kbKeys[kbCount++];
+  k.x = x; k.y = y; k.w = w; k.h = KEY_H; k.code = code;
+  strlcpy(k.label, label, sizeof(k.label));
+}
+
+// Rebuild the live key list for the current kbMode.
+void kbBuild() {
+  kbCount = 0;
+  const char *r0 = "1234567890", *r1, *r2, *r3;
+  if      (kbMode == KB_SYM)   { r1 = "!@#$%^&*()"; r2 = "-_=+[]{};:"; r3 = ".,?/~|'"; }
+  else if (kbMode == KB_UPPER) { r1 = "QWERTYUIOP"; r2 = "ASDFGHJKL";  r3 = "ZXCVBNM"; }
+  else                         { r1 = "qwertyuiop"; r2 = "asdfghjkl";  r3 = "zxcvbnm"; }
+
+  int16_t y = KB_Y0;
+  auto charRow = [&](const char* s, int16_t x0) {
+    for (int i = 0; s[i]; i++) {
+      char t[2] = { s[i], 0 };
+      kbAddKey(x0 + i * KEY_U, y, KEY_U - KEY_G, t, (int)(unsigned char)s[i]);
+    }
+  };
+
+  charRow(r0, 0);                                   y += KEY_H + KEY_G;
+  charRow(r1, 0);                                   y += KEY_H + KEY_G;
+  charRow(r2, (SCREEN_W - (int)strlen(r2) * KEY_U) / 2); y += KEY_H + KEY_G;
+
+  // Row with SHIFT + 7 letters + DEL.
+  int16_t shiftW = 36;                              // 1.5 units
+  int len3 = strlen(r3);
+  kbAddKey(0, y, shiftW - KEY_G, kbMode == KB_UPPER ? "v" : "^", KC_SHIFT);
+  for (int i = 0; i < len3; i++) {
+    char t[2] = { r3[i], 0 };
+    kbAddKey(shiftW + i * KEY_U, y, KEY_U - KEY_G, t, (int)(unsigned char)r3[i]);
+  }
+  int16_t bx = shiftW + len3 * KEY_U;
+  kbAddKey(bx, y, (SCREEN_W - bx) - KEY_G, "DEL", KC_BKSP);
+  y += KEY_H + KEY_G;
+
+  // Function row: symbols toggle + space + OK.
+  kbAddKey(0,          y, 2 * KEY_U - KEY_G, kbMode == KB_SYM ? "ABC" : "123", KC_SYM);
+  kbAddKey(2 * KEY_U,  y, 6 * KEY_U - KEY_G, "space", ' ');
+  kbAddKey(8 * KEY_U,  y, 2 * KEY_U - KEY_G, "OK",    KC_OK);
+}
+
+void kbDraw() {
+  for (int i = 0; i < kbCount; i++) {
+    LiveKey& k = kbKeys[i];
+    uint16_t bg = (k.code == KC_OK) ? C_ACCENT_DK
+                : (k.code < 0)      ? C_SURFACE
+                                    : C_SURFACE_HI;
+    tft.fillRoundRect(k.x, k.y, k.w, k.h, 4, bg);
+    tft.drawRoundRect(k.x, k.y, k.w, k.h, 4, C_BORDER);
+    tft.setTextColor(C_TEXT);
+    int len = strlen(k.label);
+    if (len <= 1) {
+      tft.setTextSize(2);
+      tft.setCursor(k.x + (k.w - 12) / 2, k.y + (k.h - 16) / 2);
+    } else {
+      tft.setTextSize(1);
+      tft.setCursor(k.x + (k.w - len * 6) / 2, k.y + (k.h - 8) / 2);
+    }
+    tft.print(k.label);
+  }
+}
+
+int kbHit(uint16_t x, uint16_t y) {
+  for (int i = 0; i < kbCount; i++) {
+    LiveKey& k = kbKeys[i];
+    if (x >= k.x && x < k.x + k.w && y >= k.y && y < k.y + k.h) return k.code;
+  }
+  return 0;
+}
+
+// --- password entry --------------------------------------------------------
+// Drives the keyboard. Returns true if OK was pressed (pass filled), false if
+// the user cancelled (X in the title bar).
+bool wifiEnterPassword(const String& ssid, String& pass) {
+  pass = "";
+  kbMode = KB_LOWER;
+
+  auto drawField = [&]() {
+    tft.fillRect(10, 58, SCREEN_W - 20, 26, C_SURFACE);
+    tft.setTextColor(C_TEXT); tft.setTextSize(2);
+    const char* p = pass.c_str();
+    int L = pass.length(), maxc = 18;            // show the trailing chars that fit
+    char shown[20];
+    strlcpy(shown, L > maxc ? p + (L - maxc) : p, sizeof(shown));
+    tft.setCursor(12, 61); tft.print(shown);
+  };
+
+  // Header: title, cancel X, network name, password field.
+  tft.fillScreen(C_BG);
+  tft.fillRect(0, 0, SCREEN_W, 34, C_SURFACE);
+  tft.setTextColor(C_ACCENT); tft.setTextSize(2);
+  tft.setCursor(8, 9); tft.print("Password");
+  tft.setTextColor(C_RED);
+  tft.setCursor(SCREEN_W - 22, 9); tft.print("X");
+  tft.setTextColor(C_TEXT_DIM); tft.setTextSize(1);
+  tft.setCursor(8, 40); tft.print("Network: ");
+  char b[24]; strlcpy(b, ssid.c_str(), sizeof(b)); tft.print(b);
+  tft.drawRoundRect(8, 56, SCREEN_W - 16, 30, 4, C_BORDER);
+  drawField();
+  kbBuild(); kbDraw();
+
+  for (;;) {
+    uint16_t x, y;
+    if (readTap(&x, &y)) {
+      if (y < 34 && x > SCREEN_W - 30) return false;      // cancel X
+      int c = kbHit(x, y);
+      if (c == 0) { /* miss */ }
+      else if (c == KC_OK)    return true;
+      else if (c == KC_BKSP)  { if (pass.length()) pass.remove(pass.length() - 1); drawField(); }
+      else if (c == KC_SHIFT) { kbMode = (kbMode == KB_UPPER) ? KB_LOWER : KB_UPPER; kbBuild(); kbDraw(); }
+      else if (c == KC_SYM)   { kbMode = (kbMode == KB_SYM)   ? KB_LOWER : KB_SYM;   kbBuild(); kbDraw(); }
+      else if (c > 0) {
+        if (pass.length() < 63) pass += (char)c;
+        drawField();
+        if (kbMode == KB_UPPER) { kbMode = KB_LOWER; kbBuild(); kbDraw(); }  // auto-unshift
+      }
+    }
+    delay(8);
+  }
+}
+
+// --- top-level interactive provisioning ------------------------------------
+// Loops until connected, or returns false if the user cancels the picker.
+bool wifiSetupFlow() {
+  for (;;) {
+    String ssid = wifiPickNetwork();
+    if (ssid.length() == 0) return WiFi.status() == WL_CONNECTED;  // cancelled
+
+    String pass;
+    if (!wifiEnterPassword(ssid, pass)) continue;                 // back to list
+
+    if (wifiConnect(ssid, pass, 15000)) {
+      wifiSsid = ssid; wifiPass = pass;
+      saveWifiCreds(ssid, pass);
+      return true;
+    }
+    // Failed: let the user retry.
+    tft.fillScreen(C_BG);
+    tft.setTextColor(C_RED); tft.setTextSize(2);
+    tft.setCursor(10, 120); tft.print("Connect failed");
+    tft.setTextColor(C_TEXT_DIM); tft.setTextSize(1);
+    tft.setCursor(10, 150); tft.print("Tap to try again");
+    uint16_t tx, ty;
+    while (!readTap(&tx, &ty)) delay(10);
+  }
+}
+
+// Re-open provisioning from the running radio (long-press the title bar).
+void openWifiSetup() {
+  stopRadio();
+  digitalWrite(PA_EN, PA_OFF);
+  setBacklight(true);
+  bool ok = wifiSetupFlow();
+  if (!ok && wifiSsid.length())               // cancelled: restore prior link
+    ok = wifiConnect(wifiSsid, wifiPass, 15000);
+  drawUI();
+  lastTouchMs = millis();
+  if (ok) {
+    digitalWrite(PA_EN, PA_ON);
+    startStation(curStation);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Setup / loop
 // ---------------------------------------------------------------------------
@@ -502,19 +840,23 @@ void setup() {
   pinMode(PA_EN, OUTPUT);
   digitalWrite(PA_EN, PA_OFF);
 
-  // WiFi
+  // WiFi: try the saved credentials (NVS), falling back to a one-time seed from
+  // secrets.h on first boot, and finally to the on-screen scan + keyboard UI.
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
-    delay(250);
-    Serial.print('.');
+  loadWifiCreds();
+  if (wifiSsid.length() == 0 && strlen(WIFI_SSID)) {
+    wifiSsid = WIFI_SSID;                 // seed from secrets.h, not yet saved
+    wifiPass = WIFI_PASS;
   }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED)
-    Serial.printf("WiFi OK  %s\n", WiFi.localIP().toString().c_str());
+  bool wifiOk = false;
+  if (wifiSsid.length())
+    wifiOk = wifiConnect(wifiSsid, wifiPass, 15000);
+  if (wifiOk)
+    saveWifiCreds(wifiSsid, wifiPass);    // persist confirmed credentials
   else
-    Serial.println("WiFi FAILED - check SSID/password");
+    wifiOk = wifiSetupFlow();             // scan + type the password on-panel
+  if (!wifiOk)
+    Serial.println("WiFi not configured");
 
   // I2S out -> ES8311. Start I2S first so MCLK is running for codec config.
   audio.setPinout(I2S_BCLK, I2S_LRCK, I2S_DOUT, I2S_MCLK);
@@ -542,6 +884,23 @@ void setup() {
 void handleTouch() {
   static bool     wasTouched = false;
   static uint32_t lastPress  = 0;
+
+  // Long-press the title bar (top 34px) for ~1.5s to re-open WiFi setup. This
+  // is the only way to change networks once credentials are saved.
+  static bool     holding    = false;
+  static uint32_t holdStart  = 0;
+  {
+    uint16_t hx, hy;
+    bool inTitle = digitalRead(TOUCH_INT) == LOW && getTouch(&hx, &hy) && hy < 34;
+    if (inTitle) {
+      if (!holding) { holding = true; holdStart = millis(); }
+      else if (millis() - holdStart > 1500) {
+        holding = wasTouched = false;
+        openWifiSetup();
+        return;
+      }
+    } else holding = false;
+  }
 
   // The FT6336 holds INT low only while a finger is on the panel. When it is
   // high there is nothing to report, so skip the I2C transaction entirely.
