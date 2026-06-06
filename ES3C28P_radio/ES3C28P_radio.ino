@@ -625,7 +625,11 @@ struct LiveKey { int16_t x, y, w, h; char label[6]; int code; };
 LiveKey kbKeys[48];
 int     kbCount = 0;
 
-const int16_t KB_Y0 = 140, KEY_H = 32, KEY_G = 3, KEY_U = 24;  // 10 units across
+// Alphabetical grid keyboard. Letters use 7 wide columns (~34px keys) so they
+// are easy to hit; digits stay on a permanent 10-key top row. KB_Y0 sits just
+// under the password field to give the keys as much height as the panel allows.
+const int16_t KB_Y0 = 96, KEY_H = 33, KEY_G = 3;
+const int16_t KB_STRIDE = KEY_H + KEY_G;
 
 void kbAddKey(int16_t x, int16_t y, int16_t w, const char* label, int code) {
   LiveKey& k = kbKeys[kbCount++];
@@ -633,45 +637,49 @@ void kbAddKey(int16_t x, int16_t y, int16_t w, const char* label, int code) {
   strlcpy(k.label, label, sizeof(k.label));
 }
 
+// Lay out a row of single-character keys, centred across the screen.
+static void kbCharRow(const char* s, int cols, int16_t y) {
+  int n = strlen(s);
+  int16_t cell = SCREEN_W / cols;
+  int16_t x0   = (SCREEN_W - n * cell) / 2;
+  for (int i = 0; i < n; i++) {
+    char t[2] = { s[i], 0 };
+    kbAddKey(x0 + i * cell, y, cell - KEY_G, t, (int)(unsigned char)s[i]);
+  }
+}
+
 // Rebuild the live key list for the current kbMode.
 void kbBuild() {
   kbCount = 0;
-  const char *r0 = "1234567890", *r1, *r2, *r3;
-  if      (kbMode == KB_SYM)   { r1 = "!@#$%^&*()"; r2 = "-_=+[]{};:"; r3 = ".,?/~|'"; }
-  else if (kbMode == KB_UPPER) { r1 = "QWERTYUIOP"; r2 = "ASDFGHJKL";  r3 = "ZXCVBNM"; }
-  else                         { r1 = "qwertyuiop"; r2 = "asdfghjkl";  r3 = "zxcvbnm"; }
-
   int16_t y = KB_Y0;
-  auto charRow = [&](const char* s, int16_t x0) {
-    for (int i = 0; s[i]; i++) {
-      char t[2] = { s[i], 0 };
-      kbAddKey(x0 + i * KEY_U, y, KEY_U - KEY_G, t, (int)(unsigned char)s[i]);
-    }
-  };
 
-  charRow(r0, 0);                                   y += KEY_H + KEY_G;
-  charRow(r1, 0);                                   y += KEY_H + KEY_G;
-  charRow(r2, (SCREEN_W - (int)strlen(r2) * KEY_U) / 2); y += KEY_H + KEY_G;
+  // Digits are always available on the top row (10 columns).
+  kbCharRow("1234567890", 10, y); y += KB_STRIDE;
 
-  // Row with SHIFT + 7 letters + DEL.
-  int16_t shiftW = 36;                              // 1.5 units
-  int len3 = strlen(r3);
-  kbAddKey(0, y, shiftW - KEY_G, kbMode == KB_UPPER ? "v" : "^", KC_SHIFT);
-  for (int i = 0; i < len3; i++) {
-    char t[2] = { r3[i], 0 };
-    kbAddKey(shiftW + i * KEY_U, y, KEY_U - KEY_G, t, (int)(unsigned char)r3[i]);
+  if (kbMode == KB_SYM) {
+    // Four symbol rows, 7 columns each.
+    const char* sym[4] = { "!@#$%^&", "*()-_=+", "[]{};:'", ",.?/~|\\" };
+    for (int r = 0; r < 4; r++) { kbCharRow(sym[r], 7, y); y += KB_STRIDE; }
+  } else {
+    // Letters A-Z (or a-z) in reading order, 7 columns: rows of 7,7,7,5.
+    static const char* upper[4] = { "ABCDEFG", "HIJKLMN", "OPQRSTU", "VWXYZ" };
+    static const char* lower[4] = { "abcdefg", "hijklmn", "opqrstu", "vwxyz" };
+    const char** rows = (kbMode == KB_UPPER) ? upper : lower;
+    for (int r = 0; r < 4; r++) { kbCharRow(rows[r], 7, y); y += KB_STRIDE; }
   }
-  int16_t bx = shiftW + len3 * KEY_U;
-  kbAddKey(bx, y, (SCREEN_W - bx) - KEY_G, "DEL", KC_BKSP);
-  y += KEY_H + KEY_G;
 
-  // Function row: symbols toggle + space + OK.
-  kbAddKey(0,          y, 2 * KEY_U - KEY_G, kbMode == KB_SYM ? "ABC" : "123", KC_SYM);
-  kbAddKey(2 * KEY_U,  y, 6 * KEY_U - KEY_G, "space", ' ');
-  kbAddKey(8 * KEY_U,  y, 2 * KEY_U - KEY_G, "OK",    KC_OK);
+  // Function row: SHIFT, symbol toggle, space, DEL, OK.
+  kbAddKey(0,   y, 38, kbMode == KB_UPPER ? "v" : "^",        KC_SHIFT);
+  kbAddKey(41,  y, 37, kbMode == KB_SYM   ? "ABC" : "123",    KC_SYM);
+  kbAddKey(81,  y, 74, "space",                               ' ');
+  kbAddKey(158, y, 40, "DEL",                                 KC_BKSP);
+  kbAddKey(201, y, 38, "OK",                                  KC_OK);
 }
 
 void kbDraw() {
+  // Clear the whole keyboard band first so a mode switch (ABC/123, shift) that
+  // changes key positions can't leave ghost pixels of the previous layout.
+  tft.fillRect(0, KB_Y0, SCREEN_W, SCREEN_H - KB_Y0, C_BG);
   for (int i = 0; i < kbCount; i++) {
     LiveKey& k = kbKeys[i];
     uint16_t bg = (k.code == KC_OK) ? C_ACCENT_DK
