@@ -56,7 +56,7 @@
 #define ES8311_REG_DACVOL 0x32   // DAC volume: 0x00 mute .. 0xFF 0dB, 0.5dB/step
 
 // Screen dims (backlight off) after this long with no touch; any touch wakes it.
-#define SCREEN_TIMEOUT_MS 30000
+#define SCREEN_TIMEOUT_MS 60000*10  // 10 minutes - set to 0 to disable auto-dim
 
 // Flip these to 1 if the touch axes come out mirrored on your panel.
 #define TOUCH_FLIP_X 0
@@ -296,7 +296,7 @@ void drawTitleBar() {
 }
 
 void drawStation() {
-  tft.fillRect(0, 40, SCREEN_W, 38, ILI9341_BLACK);
+  tft.fillRect(4, 40, SCREEN_W - 8, 38, ILI9341_BLACK);  // inset: keep VU edge lanes
   tft.setTextColor(ILI9341_YELLOW);
   tft.setTextSize(2);
   tft.setCursor(6, 44);
@@ -311,7 +311,7 @@ void drawStation() {
 }
 
 void drawNowPlaying() {
-  tft.fillRect(0, 84, SCREEN_W, 40, ILI9341_BLACK);
+  tft.fillRect(4, 84, SCREEN_W - 8, 40, ILI9341_BLACK);  // inset: keep VU edge lanes
   tft.setTextColor(ILI9341_CYAN);
   tft.setTextSize(1);
   tft.setTextWrap(false);
@@ -360,6 +360,59 @@ void drawUI() {
   drawButton(btnVolUp);
   drawVolumeBar();
   drawPlayButton();
+}
+
+// ---------------------------------------------------------------------------
+// VU meter  -  two vertical bars in the 4px background margins either side of
+// the controls. Left edge = left channel, right edge = right channel. The
+// library's getVUlevel() gives an already-smoothed peak (0..255) per channel.
+// ---------------------------------------------------------------------------
+const int16_t VU_TOP  = 36;                 // just under the title bar
+const int16_t VU_BOT  = 310;                // just above the PLAY button
+const int16_t VU_SPAN = VU_BOT - VU_TOP;
+const int16_t VU_W    = 4;
+const int16_t VU_LX   = 0;                   // left-channel lane (x 0..3)
+const int16_t VU_RX   = SCREEN_W - VU_W;     // right-channel lane (x 236..239)
+
+// Per-lane drawn state, so each frame only paints the part that changed.
+int16_t  vuLH = 0, vuRH = 0;                 // current bar heights, px
+uint16_t vuLC = 0, vuRC = 0;                 // current bar colours (0 = none yet)
+
+// Colour by how full the lane is: green low, yellow mid, red near peak.
+uint16_t vuColor(int16_t h) {
+  if (h > VU_SPAN * 85 / 100) return ILI9341_RED;
+  if (h > VU_SPAN * 60 / 100) return ILI9341_YELLOW;
+  return ILI9341_GREEN;
+}
+
+// Repaint one lane to height h, touching only the rows that moved.
+void drawVUlane(int16_t x, int16_t h, int16_t &prevH, uint16_t &prevColor) {
+  if (h < 0) h = 0; else if (h > VU_SPAN) h = VU_SPAN;
+  uint16_t col = vuColor(h);
+  if (col != prevColor) {                    // colour changed: repaint whole lane
+    if (h > 0)        tft.fillRect(x, VU_BOT - h, VU_W, h, col);
+    if (h < VU_SPAN)  tft.fillRect(x, VU_TOP, VU_W, VU_SPAN - h, ILI9341_BLACK);
+    prevColor = col;
+  } else if (h > prevH) {                     // grew: fill the new rows on top
+    tft.fillRect(x, VU_BOT - h, VU_W, h - prevH, col);
+  } else if (h < prevH) {                     // shrank: clear the freed rows
+    tft.fillRect(x, VU_BOT - prevH, VU_W, prevH - h, ILI9341_BLACK);
+  }
+  prevH = h;
+}
+
+void updateVU() {
+  uint16_t vu = audio.getVUlevel();          // rrrrrrrrllllllll
+  int16_t lh = (int32_t)(vu & 0xFF)        * VU_SPAN / 255;
+  int16_t rh = (int32_t)((vu >> 8) & 0xFF) * VU_SPAN / 255;
+  drawVUlane(VU_LX, lh, vuLH, vuLC);
+  drawVUlane(VU_RX, rh, vuRH, vuRC);
+}
+
+// Drop both bars to zero (e.g. on STOP or when the screen dims).
+void clearVU() {
+  drawVUlane(VU_LX, 0, vuLH, vuLC);
+  drawVUlane(VU_RX, 0, vuRH, vuRC);
 }
 
 // ---------------------------------------------------------------------------
@@ -518,6 +571,18 @@ void loop() {
   if (nowPlayingDirty) {
     nowPlayingDirty = false;
     drawNowPlaying();
+  }
+
+  // VU meter: animate while playing on a lit screen (~25 fps); otherwise make
+  // sure the bars are cleared so they don't linger after STOP / dim.
+  static uint32_t lastVU = 0;
+  if (playing && screenOn) {
+    if (millis() - lastVU >= 40) {
+      lastVU = millis();
+      updateVU();
+    }
+  } else if (vuLH || vuRH) {
+    clearVU();
   }
 
   // Dim the backlight after a spell of no touches; handleTouch() wakes it again.

@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(make build *)"
+      "Bash(make build *)",
+      "Bash(cat arduino-cli.yaml 2>/dev/null | grep -i -A3 dir; echo \"===search===\"; find . -iname \"Audio.h\" 2>/dev/null | head; find ~/Documents/Arduino -iname \"Audio.h\" 2>/dev/null | grep -i audioI2S | head)",
+      "Read(//Users/rslwong/Documents/Arduino/**)"
     ]
   }
 }
