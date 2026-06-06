@@ -72,6 +72,25 @@ Preferences prefs;
 const int16_t SCREEN_W = 240;
 const int16_t SCREEN_H = 320;
 
+// ---------------------------------------------------------------------------
+// Theme  -  a modern dark palette in RGB565 (the panel is full 16-bit colour;
+// the old ILI9341_* named colours are the harsh 8-colour CGA set). Tweak the
+// hex below to reskin the whole UI.
+// ---------------------------------------------------------------------------
+#define RGB565(r,g,b) ((uint16_t)((((r)&0xF8)<<8)|(((g)&0xFC)<<3)|((b)>>3)))
+
+const uint16_t C_BG         = RGB565(0x0D,0x11,0x17);  // app background, near-black
+const uint16_t C_SURFACE    = RGB565(0x16,0x1B,0x22);  // header / panels
+const uint16_t C_SURFACE_HI = RGB565(0x25,0x2C,0x38);  // raised (neutral) buttons
+const uint16_t C_BORDER     = RGB565(0x32,0x3B,0x48);  // subtle outlines / track
+const uint16_t C_TEXT       = RGB565(0xE6,0xED,0xF3);  // primary text
+const uint16_t C_TEXT_DIM   = RGB565(0x8B,0x94,0x9E);  // secondary text
+const uint16_t C_ACCENT     = RGB565(0x3F,0xB9,0x50);  // primary accent (green)
+const uint16_t C_ACCENT_DK  = RGB565(0x23,0x86,0x36);  // accent pressed / PLAY
+const uint16_t C_BLUE       = RGB565(0x58,0xA6,0xFF);  // info accent (now playing)
+const uint16_t C_AMBER      = RGB565(0xD2,0x99,0x22);  // station / mid signal
+const uint16_t C_RED        = RGB565(0xF8,0x51,0x49);  // STOP / weak signal
+
 // Radio stations (plain-HTTP MP3 streams play most reliably on the ESP32).
 struct Station { const char* name; const char* url; };
 const Station STATIONS[] = {
@@ -123,17 +142,17 @@ volatile bool nowPlayingDirty = false;
 struct Button { int16_t x, y, w, h; const char* label; uint16_t color; };
 
 // Layout
-Button btnPrev = {   4, 130, 112, 42, "< PREV", ILI9341_DARKGREY };
-Button btnNext = { 124, 130, 112, 42, "NEXT >", ILI9341_DARKGREY };
-Button btnVolDn= {   4, 180, 112, 42, "VOL -",  ILI9341_NAVY     };
-Button btnVolUp= { 124, 180, 112, 42, "VOL +",  ILI9341_NAVY     };
+Button btnPrev = {   4, 130, 112, 42, "< PREV", C_SURFACE_HI };
+Button btnNext = { 124, 130, 112, 42, "NEXT >", C_SURFACE_HI };
+Button btnVolDn= {   4, 180, 112, 42, "VOL -",  C_SURFACE_HI };
+Button btnVolUp= { 124, 180, 112, 42, "VOL +",  C_SURFACE_HI };
 const int16_t VOLBAR_X = 4,  VOLBAR_Y = 232, VOLBAR_W = 232, VOLBAR_H = 22;
-Button btnPlay = {   4, 266, 232, 46, "PLAY",   ILI9341_DARKGREEN};
+Button btnPlay = {   4, 266, 232, 46, "PLAY",   C_ACCENT_DK };
 
 void drawButton(const Button& b) {
-  tft.fillRoundRect(b.x, b.y, b.w, b.h, 6, b.color);
-  tft.drawRoundRect(b.x, b.y, b.w, b.h, 6, ILI9341_WHITE);
-  tft.setTextColor(ILI9341_WHITE);
+  tft.fillRoundRect(b.x, b.y, b.w, b.h, 8, b.color);
+  tft.drawRoundRect(b.x, b.y, b.w, b.h, 8, C_BORDER);
+  tft.setTextColor(C_TEXT);
   tft.setTextSize(2);
   int16_t tw = (int16_t)strlen(b.label) * 12;     // ~12px per char at size 2
   tft.setCursor(b.x + (b.w - tw) / 2, b.y + (b.h - 16) / 2);
@@ -267,13 +286,13 @@ void drawWifiBars() {
   const int16_t x0      = SCREEN_W - 8 - totalW;
 
   int bars = wifiBars();
-  uint16_t onColor = bars >= 3 ? ILI9341_GREEN
-                   : bars == 2 ? ILI9341_YELLOW
-                   : bars == 1 ? ILI9341_ORANGE
-                               : ILI9341_RED;
+  uint16_t onColor = bars >= 3 ? C_ACCENT
+                   : bars == 2 ? C_AMBER
+                   : bars == 1 ? C_AMBER
+                               : C_RED;
 
-  // clear the icon area first
-  tft.fillRect(x0, 6, totalW, 22, ILI9341_MAROON);
+  // clear the icon area first (must match the title-bar background)
+  tft.fillRect(x0, 6, totalW, 22, C_SURFACE);
 
   for (int i = 0; i < nBars; i++) {
     int16_t h = 6 + i * 4;           // 6, 10, 14, 18 px tall
@@ -282,13 +301,13 @@ void drawWifiBars() {
     if (i < bars)
       tft.fillRect(x, y, barW, h, onColor);
     else
-      tft.drawRect(x, y, barW, h, ILI9341_DARKGREY);
+      tft.drawRect(x, y, barW, h, C_BORDER);
   }
 }
 
 void drawTitleBar() {
-  tft.fillRect(0, 0, SCREEN_W, 34, ILI9341_MAROON);
-  tft.setTextColor(ILI9341_WHITE);
+  tft.fillRect(0, 0, SCREEN_W, 34, C_SURFACE);
+  tft.setTextColor(C_ACCENT);
   tft.setTextSize(2);
   tft.setCursor(8, 9);
   tft.print("Net Radio");
@@ -296,23 +315,23 @@ void drawTitleBar() {
 }
 
 void drawStation() {
-  tft.fillRect(4, 40, SCREEN_W - 8, 38, ILI9341_BLACK);  // inset: keep VU edge lanes
-  tft.setTextColor(ILI9341_YELLOW);
+  tft.fillRect(4, 40, SCREEN_W - 8, 38, C_BG);  // inset: keep VU edge lanes
+  tft.setTextColor(C_TEXT);
   tft.setTextSize(2);
   tft.setCursor(6, 44);
   // clip name to one line (~19 chars at size 2)
   char buf[24];
   strlcpy(buf, STATIONS[curStation].name, sizeof(buf));
   tft.print(buf);
-  tft.setTextColor(ILI9341_DARKGREY);
+  tft.setTextColor(C_TEXT_DIM);
   tft.setTextSize(1);
   tft.setCursor(6, 66);
   tft.printf("Station %d/%d", curStation + 1, NUM_STATIONS);
 }
 
 void drawNowPlaying() {
-  tft.fillRect(4, 84, SCREEN_W - 8, 40, ILI9341_BLACK);  // inset: keep VU edge lanes
-  tft.setTextColor(ILI9341_CYAN);
+  tft.fillRect(4, 84, SCREEN_W - 8, 40, C_BG);  // inset: keep VU edge lanes
+  tft.setTextColor(C_BLUE);
   tft.setTextSize(1);
   tft.setTextWrap(false);
   // up to two ~39-char lines
@@ -329,28 +348,28 @@ void drawNowPlaying() {
 }
 
 void drawVolumeBar() {
-  tft.drawRect(VOLBAR_X, VOLBAR_Y, VOLBAR_W, VOLBAR_H, ILI9341_WHITE);
+  tft.drawRoundRect(VOLBAR_X, VOLBAR_Y, VOLBAR_W, VOLBAR_H, 4, C_BORDER);
   int16_t inner = VOLBAR_W - 4;
   int16_t fill  = (int32_t)inner * volume / VOL_MAX;
-  tft.fillRect(VOLBAR_X + 2, VOLBAR_Y + 2, fill, VOLBAR_H - 4, ILI9341_GREEN);
-  tft.fillRect(VOLBAR_X + 2 + fill, VOLBAR_Y + 2, inner - fill, VOLBAR_H - 4, ILI9341_BLACK);
-  tft.setTextColor(ILI9341_WHITE);
+  tft.fillRect(VOLBAR_X + 2, VOLBAR_Y + 2, fill, VOLBAR_H - 4, C_ACCENT);
+  tft.fillRect(VOLBAR_X + 2 + fill, VOLBAR_Y + 2, inner - fill, VOLBAR_H - 4, C_SURFACE);
+  tft.setTextColor(C_TEXT);
   tft.setTextSize(1);
   char v[16];
   snprintf(v, sizeof(v), "VOL %u/%u", volume, VOL_MAX);
   tft.setCursor(VOLBAR_X + VOLBAR_W / 2 - 24, VOLBAR_Y + VOLBAR_H + 4);
-  tft.fillRect(VOLBAR_X, VOLBAR_Y + VOLBAR_H + 2, VOLBAR_W, 10, ILI9341_BLACK);
+  tft.fillRect(VOLBAR_X, VOLBAR_Y + VOLBAR_H + 2, VOLBAR_W, 10, C_BG);
   tft.print(v);
 }
 
 void drawPlayButton() {
   btnPlay.label = playing ? "STOP" : "PLAY";
-  btnPlay.color = playing ? ILI9341_RED : ILI9341_DARKGREEN;
+  btnPlay.color = playing ? C_RED : C_ACCENT_DK;
   drawButton(btnPlay);
 }
 
 void drawUI() {
-  tft.fillScreen(ILI9341_BLACK);
+  tft.fillScreen(C_BG);
   drawTitleBar();
   drawStation();
   drawNowPlaying();
@@ -380,9 +399,9 @@ uint16_t vuLC = 0, vuRC = 0;                 // current bar colours (0 = none ye
 
 // Colour by how full the lane is: green low, yellow mid, red near peak.
 uint16_t vuColor(int16_t h) {
-  if (h > VU_SPAN * 85 / 100) return ILI9341_RED;
-  if (h > VU_SPAN * 60 / 100) return ILI9341_YELLOW;
-  return ILI9341_GREEN;
+  if (h > VU_SPAN * 85 / 100) return C_RED;
+  if (h > VU_SPAN * 60 / 100) return C_AMBER;
+  return C_ACCENT;
 }
 
 // Repaint one lane to height h, touching only the rows that moved.
@@ -391,12 +410,12 @@ void drawVUlane(int16_t x, int16_t h, int16_t &prevH, uint16_t &prevColor) {
   uint16_t col = vuColor(h);
   if (col != prevColor) {                    // colour changed: repaint whole lane
     if (h > 0)        tft.fillRect(x, VU_BOT - h, VU_W, h, col);
-    if (h < VU_SPAN)  tft.fillRect(x, VU_TOP, VU_W, VU_SPAN - h, ILI9341_BLACK);
+    if (h < VU_SPAN)  tft.fillRect(x, VU_TOP, VU_W, VU_SPAN - h, C_BG);
     prevColor = col;
   } else if (h > prevH) {                     // grew: fill the new rows on top
     tft.fillRect(x, VU_BOT - h, VU_W, h - prevH, col);
   } else if (h < prevH) {                     // shrank: clear the freed rows
-    tft.fillRect(x, VU_BOT - prevH, VU_W, prevH - h, ILI9341_BLACK);
+    tft.fillRect(x, VU_BOT - prevH, VU_W, prevH - h, C_BG);
   }
   prevH = h;
 }
@@ -457,8 +476,12 @@ void setup() {
   SPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI, TFT_CS);
   tft.begin();
   tft.setRotation(0);
-  tft.fillScreen(ILI9341_BLACK);
-  tft.setTextColor(ILI9341_WHITE);
+  // This IPS ILI9341V glass needs colour inversion ON, otherwise everything
+  // shows as its complement (dark background comes out white). Flip to false
+  // if a future panel looks inverted the other way.
+  tft.invertDisplay(true);
+  tft.fillScreen(C_BG);
+  tft.setTextColor(C_TEXT);
   tft.setTextSize(2);
   tft.setCursor(10, 140);
   tft.print("Connecting WiFi");
