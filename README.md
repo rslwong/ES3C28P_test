@@ -6,10 +6,10 @@ audio).
 
 Four sketches (AI generated) are included:
 
-- **`ES3C28P_radio`** *(default)* — internet radio. Connects to WiFi, streams
-  MP3 stations, and drives the speaker through the ES8311 codec. On-screen
-  touch controls: `PREV`/`NEXT` station, `VOL-`/`VOL+`, a volume bar, and
-  `PLAY`/`STOP`. The current track title (ICY metadata) is shown live.
+- **`ES3C28P_radio`** *(default)* — internet radio. Joins WiFi (set up on-screen,
+  no recompile), streams MP3 stations, and drives the speaker through the ES8311
+  codec. On-screen touch controls: `PREV`/`NEXT` station, `VOL-`/`VOL+`, a volume
+  bar, and `PLAY`/`STOP`. The current track title (ICY metadata) is shown live.
 - **`ES3C28P_mic`** — microphone test / real-time spectrum analyzer. Captures
   the on-board mic (ES8311 ADC → I2S), runs a 256-point FFT, and draws a
   log-spaced bar-graph spectrum with peak-hold markers. A level meter and a
@@ -59,9 +59,29 @@ make ports                          # list attached boards
 
 ## Internet radio (ES3C28P_radio)
 
-WiFi credentials and the station list are hard-coded near the top of
-[ES3C28P_radio.ino](ES3C28P_radio/ES3C28P_radio.ino) (`WIFI_SSID`/`WIFI_PASS`
-and the `STATIONS[]` array — add your own plain-HTTP MP3/AAC stream URLs).
+### WiFi setup (on-screen, saved on the board)
+
+WiFi is provisioned from the touchscreen — no credentials in the source. On
+first boot the radio scans for networks, you tap yours from the list and type
+the password on the on-screen keyboard (lowercase / `SHIFT` uppercase / `123`
+symbols, with `DEL`, space and `OK`). The credentials are written to the
+ESP32's NVS flash and reused automatically on every reboot, so this is a
+one-time step.
+
+To change networks later, **long-press the title bar (~1.5 s)** to re-open the
+setup screen.
+
+`secrets.h` is now **optional**. If you'd rather pre-seed a network so the board
+comes up connected on its very first boot (before anything is saved), copy
+[secrets.h.example](ES3C28P_radio/secrets.h.example) to `secrets.h` and fill in
+`WIFI_SSID`/`WIFI_PASS`; it is used only until the first successful connection is
+saved, then ignored. The sketch builds fine with no `secrets.h` at all.
+
+### Stations
+
+The station list is hard-coded in the `STATIONS[]` array near the top of
+[ES3C28P_radio.ino](ES3C28P_radio/ES3C28P_radio.ino) — add your own plain-HTTP
+MP3/AAC stream URLs.
 
 Audio chain: ESP32-S3 I2S → **ES8311** codec (configured over I2C) →
 **FM8002E** amp (enable on GPIO1, active-low) → speaker. The ES8311 has no
