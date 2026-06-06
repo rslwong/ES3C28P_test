@@ -76,7 +76,10 @@ const Station STATIONS[] = {
   { "RT HK Radio 1",         "https://rthk.hk/live1.m3u" },
   { "RT HK Radio 2",         "https://rthk.hk/live2.m3u" },
   { "RT HK Radio 3",         "https://rthk.hk/live3.m3u" },
-  { "RT HK Radio 4",         "https://rthk.hk/live4.m3u" }
+  { "RT HK Radio 4",         "https://rthk.hk/live4.m3u" },
+  { "57FM",                  "https://listen.57fm.com/lscafe" },
+  { "Toronto Cast",          "https://maggie.torontocast.com:8022/stream" }
+
 };
 const int NUM_STATIONS = sizeof(STATIONS) / sizeof(STATIONS[0]);
 

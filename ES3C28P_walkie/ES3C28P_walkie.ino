@@ -46,6 +46,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <esp_mac.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <Adafruit_GFX.h>
@@ -90,28 +91,55 @@
 // ---------------------------------------------------------------------------
 // Audio / transport settings
 // ---------------------------------------------------------------------------
-#define SAMPLE_RATE      16000   // Hz, mono. Voice quality, 256 kbps raw.
+#define SAMPLE_RATE      8000    // Hz, mono. Telephone quality, 128 kbps raw.
+                                 // Lowered from 16 kHz to fit the Long-Range PHY's
+                                 // airtime budget (see USE_LONG_RANGE below).
 #define SAMPLES_PER_PKT  120     // 120 * 2 bytes = 240B payload (<=250 ESP-NOW)
 #define PKT_MAGIC        0xA5
 
 // ES8311 mic gain knobs (carried over from ES3C28P_mic - raise if mic is quiet).
 #define MIC_PGA_GAIN 0x24        // reg 0x16 - analog PGA stage
 #define ADC_VOLUME   0xE6        // reg 0x17 - digital ADC volume (0..255)
-#define DAC_VOLUME   0xBF        // reg 0x32 - DAC volume (from ES3C28P_radio)
+
+// DAC playback volume (reg 0x32, 0..255, ~0.5 dB/step). This is the speaker
+// loudness knob and is now adjustable at runtime with the on-screen +/- buttons.
+// Default raised from the old 0xBF for a noticeably louder starting level.
+#define DAC_VOLUME_DEFAULT 0xF0  // ~94% - loud default (was 0xBF)
+#define DAC_VOLUME_MAX     0xFF
+#define DAC_VOLUME_MIN     0x40  // floor so "min" still produces audible output
+#define DAC_VOLUME_STEP    0x10  // per +/- tap
 
 // ESP-NOW peering. Default: broadcast, so the identical binary works on both
 // boards with zero configuration. To lock to a single partner, set USE_BROADCAST
 // to 0 and put the OTHER board's STA MAC (printed on serial at boot) in PEER_MAC.
 #define USE_BROADCAST 1
 #define WIFI_CHANNEL  1
-static uint8_t PEER_MAC[6]   = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+
+// --- Range tuning ---------------------------------------------------------
+// TX power: crank the radio to its maximum (~20 dBm). Units are 0.25 dBm, so
+// 84 = 21 dBm (driver clamps to the legal max). Pure win, no downside.
+#define MAX_TX_POWER  84
+// Long-Range PHY (Espressif proprietary): trades data rate for a much lower,
+// more robust modulation - can multiply usable range several-fold. BOTH boards
+// must run with this enabled. It lowers throughput, so it is paired with a
+// lower SAMPLE_RATE above; if you bump the rate back up while LR is on you may
+// hear dropouts (watch the "ovf"/"drop" stats). Set to 0 for normal mode.
+#define USE_LONG_RANGE 1
+//static uint8_t PEER_MAC[6]   = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+static uint8_t PEER_MAC[6]   = { 0x14, 0xc1, 0x9f, 0xd0, 0x57, 0x20 };     // old
+
+
+//static uint8_t PEER_MAC[6]   = { 0x14, 0xc1, 0x9f, 0xd0, 0x58, 0xb8 };      // new
+
+
+
 static uint8_t BCAST_MAC[6]  = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
 // Jitter buffer: queue a little audio before playback so dropped/late packets
 // don't click. RING_SIZE must be a power of two. ~0.25 s at 16 kHz.
 #define RING_SIZE        4096            // int16 samples (must be power of 2)
 #define RING_MASK        (RING_SIZE - 1)
-#define PREBUFFER        (SAMPLES_PER_PKT * 4)   // ~30 ms before we start playing
+#define PREBUFFER        (SAMPLES_PER_PKT * 4)   // ~60 ms before we start playing
 
 // ---------------------------------------------------------------------------
 // Packet layout (244 bytes on the wire)
@@ -153,11 +181,36 @@ volatile uint32_t pktsTx = 0, pktsRx = 0, pktsDrop = 0, ringOverflow = 0;
 volatile uint8_t  lastRxSeq = 0;
 volatile bool     haveLastRx = false;
 
+// Identity / link info shown on screen.
+char              myMacStr[18] = "??:??:??:??:??:??";   // this board's STA MAC
+volatile uint8_t  peerMac[6]   = {0};                   // last sender we heard from
+volatile bool     havePeer     = false;
+volatile uint32_t lastRxMillis = 0;     // when we last received a voice packet
+
+// DAC playback volume, adjustable at runtime via the on-screen +/- buttons.
+uint8_t           dacVolume    = DAC_VOLUME_DEFAULT;
+
+// Cached "receiving voice" indicator state (-1 = needs redraw) so we only repaint
+// the blinking sign when it actually changes.
+int8_t            rxIndState   = -1;
+bool              peerDrawn    = false;
+
 // ---------------------------------------------------------------------------
 // PTT button
 // ---------------------------------------------------------------------------
 struct Button { int16_t x, y, w, h; };
-Button btnPtt = { 10, 150, 220, 150 };
+
+// Vertical layout bands (rotation 0, 240x320).
+#define Y_STATE   36     // TX/RX banner
+#define H_STATE   50
+#define Y_MAC     90     // two lines: own MAC + peer MAC
+#define Y_STATS   120    // packet counters
+#define Y_VOL     138    // volume row (- bar +)
+#define H_VOL     54
+
+Button btnPtt   = { 10, 200, 220, 112 };   // hold-to-talk
+Button btnVolDn = { 10,  Y_VOL,  60, H_VOL };
+Button btnVolUp = { 170, Y_VOL,  60, H_VOL };
 
 bool hit(const Button& b, int16_t x, int16_t y) {
   return x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h;
@@ -256,7 +309,7 @@ bool es8311InitDuplex() {
   es8311Write(0x1C, 0x6A);            // ADC HPF / EQ bypass
 
   // DAC playback path
-  es8311Write(0x32, DAC_VOLUME);      // DAC volume (from ES3C28P_radio)
+  es8311Write(0x32, dacVolume);       // DAC volume (runtime-adjustable, see +/-)
   es8311Write(0x37, 0x08);            // ramp rate (shared by both paths)
   es8311Write(0x44, 0x50);            // data path: DAC fed from SDP IN (no loopback)
 
@@ -288,6 +341,12 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
   haveLastRx = true;
   pktsRx++;
 
+  // Remember who we are hearing (for the on-screen peer MAC) and when, so the UI
+  // can light up a "receiving voice" sign while packets are arriving.
+  memcpy((void*)peerMac, info->src_addr, 6);
+  havePeer     = true;
+  lastRxMillis = millis();
+
   uint32_t head = ringHead;
   uint32_t tail = ringTail;
   for (uint16_t i = 0; i < n; i++) {
@@ -312,18 +371,109 @@ void drawTitleBar() {
   tft.print("Walkie-Talkie");
 }
 
+// "Receiving voice" sign: a green dot at the right of the RX banner that blinks
+// while voice packets are arriving from the peer, hollow grey when idle. This is
+// the cue the listening side gets while the other side is transmitting.
+void drawRxIndicator() {
+  const int16_t cx = 200, cy = Y_STATE + H_STATE / 2;
+  bool active = !txMode && (millis() - lastRxMillis < 300);
+
+  int8_t want;                      // 0 = idle dot, 1/2 = blink phases, 3 = hidden (TX)
+  if (txMode)        want = 3;
+  else if (!active)  want = 0;
+  else               want = ((millis() / 250) & 1) ? 1 : 2;
+
+  if (want == rxIndState) return;
+  rxIndState = want;
+
+  uint16_t bg = txMode ? ILI9341_RED : ILI9341_DARKGREEN;
+  tft.fillRect(cx - 26, Y_STATE + 2, 52, H_STATE - 4, bg);   // clear the dot area
+  if (want == 3) return;                                     // TX: no RX sign
+
+  if (want == 0) {                  // idle: hollow outline
+    tft.drawCircle(cx, cy, 13, ILI9341_DARKGREY);
+  } else {                          // receiving: filled, blinking bright/dim green
+    tft.fillCircle(cx, cy, 13, want == 1 ? ILI9341_GREEN : 0x05A0);
+    tft.setTextColor(ILI9341_WHITE);
+    tft.setTextSize(1);
+    tft.setCursor(cx - 27, cy - 3);
+    tft.print(" RX");
+  }
+}
+
 void drawState() {
-  // Big state banner
-  tft.fillRect(0, 40, SCREEN_W, 70, txMode ? ILI9341_RED : ILI9341_DARKGREEN);
+  // Big state banner: TX (red) / RX (green) on the left, RX-voice sign on right.
+  tft.fillRect(0, Y_STATE, SCREEN_W, H_STATE,
+               txMode ? ILI9341_RED : ILI9341_DARKGREEN);
   tft.setTextColor(ILI9341_WHITE);
   tft.setTextSize(4);
-  const char* label = txMode ? "TX" : "RX";
-  int16_t tw = (int16_t)strlen(label) * 24;        // ~24px per char at size 4
-  tft.setCursor((SCREEN_W - tw) / 2, 56);
-  tft.print(label);
+  tft.setCursor(16, Y_STATE + 9);
+  tft.print(txMode ? "TX" : "RX");
   tft.setTextSize(1);
-  tft.setCursor((SCREEN_W - 19 * 6) / 2, 96);
-  tft.print(txMode ? "  transmitting...  " : " listening (hold PTT)");
+  tft.setCursor(16, Y_STATE + H_STATE - 11);
+  tft.print(txMode ? "transmitting..." : "listening");
+
+  rxIndState = -1;                  // force the indicator to repaint
+  drawRxIndicator();
+}
+
+// Own MAC (cyan) and the peer we are linked with (yellow). Peer is the source of
+// the most recent voice packet, so it reflects who we are actually talking to.
+void drawMacInfo() {
+  tft.fillRect(0, Y_MAC, SCREEN_W, 28, ILI9341_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_CYAN);
+  tft.setCursor(6, Y_MAC);
+  tft.printf("Me:   %s", myMacStr);
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.setCursor(6, Y_MAC + 14);
+  if (havePeer)
+    tft.printf("Peer: %02X:%02X:%02X:%02X:%02X:%02X",
+               peerMac[0], peerMac[1], peerMac[2],
+               peerMac[3], peerMac[4], peerMac[5]);
+  else
+    tft.print("Peer: (waiting for audio...)");
+}
+
+// Volume row: [-]  NN%  [+]  with a small level bar.
+void drawVolume() {
+  // Minus / plus buttons.
+  tft.fillRoundRect(btnVolDn.x, btnVolDn.y, btnVolDn.w, btnVolDn.h, 8, ILI9341_NAVY);
+  tft.drawRoundRect(btnVolDn.x, btnVolDn.y, btnVolDn.w, btnVolDn.h, 8, ILI9341_WHITE);
+  tft.fillRoundRect(btnVolUp.x, btnVolUp.y, btnVolUp.w, btnVolUp.h, 8, ILI9341_NAVY);
+  tft.drawRoundRect(btnVolUp.x, btnVolUp.y, btnVolUp.w, btnVolUp.h, 8, ILI9341_WHITE);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(4);
+  tft.setCursor(btnVolDn.x + btnVolDn.w / 2 - 8, btnVolDn.y + H_VOL / 2 - 16);
+  tft.print("-");
+  tft.setCursor(btnVolUp.x + btnVolUp.w / 2 - 12, btnVolUp.y + H_VOL / 2 - 16);
+  tft.print("+");
+
+  // Middle: percentage + level bar.
+  const int16_t mx = btnVolDn.x + btnVolDn.w + 8;          // 78
+  const int16_t mw = btnVolUp.x - 8 - mx;                  // ~84
+  int pct = (int)dacVolume * 100 / 255;
+  tft.fillRect(mx, Y_VOL, mw, H_VOL, ILI9341_BLACK);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(2);
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%d%%", pct);
+  int16_t tw = (int16_t)strlen(buf) * 12;
+  tft.setCursor(mx + (mw - tw) / 2, Y_VOL + 6);
+  tft.print(buf);
+  int16_t barY = Y_VOL + H_VOL - 16;
+  tft.drawRect(mx, barY, mw, 10, ILI9341_WHITE);
+  tft.fillRect(mx + 1, barY + 1, (mw - 2) * pct / 100, 8, ILI9341_GREEN);
+}
+
+// Clamp + apply a new DAC volume, repaint the row only on a real change.
+void setDacVolume(int v) {
+  if (v < DAC_VOLUME_MIN) v = DAC_VOLUME_MIN;
+  if (v > DAC_VOLUME_MAX) v = DAC_VOLUME_MAX;
+  if ((uint8_t)v == dacVolume) return;
+  dacVolume = (uint8_t)v;
+  es8311Write(0x32, dacVolume);
+  drawVolume();
 }
 
 void drawPttButton() {
@@ -344,10 +494,10 @@ void drawPttButton() {
 }
 
 void drawStats() {
-  tft.fillRect(0, 120, SCREEN_W, 22, ILI9341_BLACK);
+  tft.fillRect(0, Y_STATS, SCREEN_W, 14, ILI9341_BLACK);
   tft.setTextColor(ILI9341_DARKGREY);
   tft.setTextSize(1);
-  tft.setCursor(6, 122);
+  tft.setCursor(6, Y_STATS + 2);
   tft.printf("TX %lu  RX %lu  drop %lu  ovf %lu",
              (unsigned long)pktsTx, (unsigned long)pktsRx,
              (unsigned long)pktsDrop, (unsigned long)ringOverflow);
@@ -357,7 +507,9 @@ void redrawAll() {
   tft.fillScreen(ILI9341_BLACK);
   drawTitleBar();
   drawState();
+  drawMacInfo();
   drawStats();
+  drawVolume();
   drawPttButton();
 }
 
@@ -407,8 +559,26 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+  // Push the radio to maximum transmit power for the best range.
+  esp_wifi_set_max_tx_power(MAX_TX_POWER);
+#if USE_LONG_RANGE
+  // Enable the proprietary Long-Range PHY in addition to the standard rates.
+  // ESP-NOW frames are then sent with LR modulation, greatly extending range.
+  esp_wifi_set_protocol(WIFI_IF_STA,
+      WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR);
+  Serial.println("Long-Range PHY enabled");
+#endif
+
+  // Read the STA MAC from eFuse directly - WiFi.macAddress() can return all-zeros
+  // right after WiFi.mode() before the interface is fully up. esp_read_mac() does
+  // not depend on the WiFi driver being started, so it is always valid here.
+  uint8_t mac[6] = {0};
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  snprintf(myMacStr, sizeof(myMacStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   Serial.print("This board STA MAC: ");
-  Serial.println(WiFi.macAddress());   // put this in PEER_MAC on the other board
+  Serial.println(myMacStr);            // also shown on screen; put in PEER_MAC on peer
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW init failed!");
@@ -482,11 +652,23 @@ void doReceive() {
 // Loop: PTT state machine + audio pump + periodic stats.
 // ---------------------------------------------------------------------------
 void loop() {
-  static uint32_t lastStats = 0;
+  static uint32_t lastStats   = 0;
+  static uint32_t lastVolStep = 0;
 
   // --- PTT: enter TX on a button press, stay until the finger lifts ---
   uint16_t tx, ty;
   bool touched = getTouch(&tx, &ty);
+
+  // --- Volume +/- (RX only). Auto-repeats while held, throttled. ---
+  if (!txMode && touched && (millis() - lastVolStep > 160)) {
+    if (hit(btnVolDn, tx, ty)) {
+      setDacVolume((int)dacVolume - DAC_VOLUME_STEP);
+      lastVolStep = millis();
+    } else if (hit(btnVolUp, tx, ty)) {
+      setDacVolume((int)dacVolume + DAC_VOLUME_STEP);
+      lastVolStep = millis();
+    }
+  }
 
   if (!txMode) {
     if (touched && hit(btnPtt, tx, ty)) {
@@ -512,6 +694,15 @@ void loop() {
 
   if (txMode) doTransmit();
   else        doReceive();
+
+  // "Receiving voice" sign - cheap, refresh every loop so it blinks promptly.
+  drawRxIndicator();
+
+  // Fill in the peer MAC the first time we hear from someone.
+  if (havePeer && !peerDrawn) {
+    peerDrawn = true;
+    drawMacInfo();
+  }
 
   // Periodic stats (cheap; doesn't disturb the audio pump much).
   if (millis() - lastStats > 500) {
