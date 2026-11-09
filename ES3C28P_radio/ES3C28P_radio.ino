@@ -395,7 +395,7 @@ void drawUI() {
 // ---------------------------------------------------------------------------
 // VU meter  -  two vertical bars in the 4px background margins either side of
 // the controls. Left edge = left channel, right edge = right channel. The
-// library's getVUlevel() gives an already-smoothed peak (0..255) per channel.
+// library's evt_vu callback gives an already-smoothed level (0..255) per channel.
 // ---------------------------------------------------------------------------
 const int16_t VU_TOP  = 36;                 // just under the title bar
 const int16_t VU_BOT  = 310;                // just above the PLAY button
@@ -407,6 +407,7 @@ const int16_t VU_RX   = SCREEN_W - VU_W;     // right-channel lane (x 236..239)
 // Per-lane drawn state, so each frame only paints the part that changed.
 int16_t  vuLH = 0, vuRH = 0;                 // current bar heights, px
 uint16_t vuLC = 0, vuRC = 0;                 // current bar colours (0 = none yet)
+uint8_t  vuL = 0, vuR = 0;                   // latest levels 0..255 from evt_vu
 
 // Colour by how full the lane is: green low, yellow mid, red near peak.
 uint16_t vuColor(int16_t h) {
@@ -432,9 +433,8 @@ void drawVUlane(int16_t x, int16_t h, int16_t &prevH, uint16_t &prevColor) {
 }
 
 void updateVU() {
-  uint16_t vu = audio.getVUlevel();          // rrrrrrrrllllllll
-  int16_t lh = (int32_t)(vu & 0xFF)        * VU_SPAN / 255;
-  int16_t rh = (int32_t)((vu >> 8) & 0xFF) * VU_SPAN / 255;
+  int16_t lh = (int32_t)vuL * VU_SPAN / 255;
+  int16_t rh = (int32_t)vuR * VU_SPAN / 255;
   drawVUlane(VU_LX, lh, vuLH, vuLC);
   drawVUlane(VU_RX, rh, vuRH, vuRC);
 }
@@ -870,12 +870,17 @@ void setup() {
   audio.setPinout(I2S_BCLK, I2S_LRCK, I2S_DOUT, I2S_MCLK);
   audio.setVolume(VOL_MAX);                // run the library at full scale;
                                            // the ES8311 register sets loudness
+  audio.settings.VU_LEVEL = true;          // emit evt_vu levels for the meter
   es8311Init();
   applyVolume();                           // set codec DAC volume from `volume`
   digitalWrite(PA_EN, PA_ON);              // enable amplifier
 
   // Receive ICY metadata (stream titles, station name) for the display.
   Audio::audio_info_callback = [](Audio::msg_t m) {
+    if (m.e == Audio::evt_vu) {            // vec1 = {left, right, peakL, peakR}
+      if (m.vec1.size() >= 2) { vuL = m.vec1[0]; vuR = m.vec1[1]; }
+      return;                              // too frequent to log
+    }
     if (!m.msg) return;
     if (m.e == Audio::evt_streamtitle) {
       strlcpy(nowPlaying, m.msg, sizeof(nowPlaying));
